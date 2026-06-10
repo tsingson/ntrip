@@ -7,6 +7,7 @@ version.txt
 **/bin/
 cmd/bin/
 **/linux-bin/
+*/bin/*
 # Test binary, build with `go test -c`
 *.test
 
