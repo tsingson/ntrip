@@ -1,5 +1,4 @@
 // CORS get location for RTK base station
-
 package main
 
 import (
@@ -11,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tsingson/ntrip/ntripio"
+	"github.com/tsingson/ntrip/ntripio" // 导入本地封装的库
 
 	"github.com/tarm/serial"
 )
