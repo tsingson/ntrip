@@ -7,50 +7,70 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	"golang.org/x/time/rate" // 需要引入官方限流库：go get golang.org/x/time/rate
 )
 
 const (
-	Rtcm3Header    = 0xD3
-	MaxRtcmLen     = 1023
-	MinRtcmLen     = 2 // 修正：RTCM3 负载至少需要包含消息类型等（通常>2字节）
-	ReadTimeout    = 45 * time.Second
-	ChanBufferSize = 256
+	Rtcm3Header = 0xD3
+	MaxRtcmLen  = 1023
+	MinRtcmLen  = 2
+	ReadTimeout = 45 * time.Second
+
+	// 商用安全策略：一个合法基准站每秒最多产生 ~5-10 个 RTCM 帧（1Hz/5Hz/10Hz 配置）
+	// 设置 50 帧/秒 的硬限制，超出即视为攻击或故障，直接熔断
+	MaxFramesPerSecond = 50
 )
 
-// 优化：定义全局哨兵错误，避免在循环中重复申请内存，支持 errors.Is()
 var (
 	ErrInvalidPreamble = errors.New("ntripio: invalid RTCM3 preamble header")
-	ErrFrameTooShort   = errors.New("ntripio: RTCM3 frame payload too short")
-	ErrFrameTooLong    = errors.New("ntripio: RTCM3 frame payload exceeds limit")
+	ErrRateLimitExceed = errors.New("ntripio: base station traffic limit exceeded")
 )
 
-// FrameBufferPool 集中管理生命周期
 var FrameBufferPool = sync.Pool{
 	New: func() interface{} {
-		// 分配 2048 字节，高并发下复用此内存
 		return make([]byte, 2048)
 	},
 }
 
+// RTKSource 升级：引入多订阅者隔离架构，彻底解决慢消费者问题
 type RTKSource struct {
 	Mountpoint string
 	conn       net.Conn
-	// 修正：传递 byte 切片。规避 channel 传递过程中重复产生 GC 压力
-	DataChan  chan []byte
-	ctx       context.Context
-	cancel    context.CancelFunc
-	closeOnce sync.Once
+	ctx        context.Context
+	cancel     context.CancelFunc
+	closeOnce  sync.Once
+	limiter    *rate.Limiter
+
+	// 订阅者注册表锁
+	subMu       sync.RWMutex
+	subscribers map[string]chan []byte
 }
 
 func NewRTKSource(parentCtx context.Context, mountpoint string, conn net.Conn) *RTKSource {
 	ctx, cancel := context.WithCancel(parentCtx)
 	return &RTKSource{
-		Mountpoint: mountpoint,
-		conn:       conn,
-		DataChan:   make(chan []byte, ChanBufferSize),
-		ctx:        ctx,
-		cancel:     cancel,
+		Mountpoint:  mountpoint,
+		conn:        conn,
+		ctx:         ctx,
+		cancel:      cancel,
+		limiter:     rate.NewLimiter(rate.Limit(MaxFramesPerSecond), MaxFramesPerSecond),
+		subscribers: make(map[string]chan []byte),
 	}
+}
+
+// RegisterSubscriber 供下游 Caster 实例（或特定路由组合）注册自己的消费通道
+func (s *RTKSource) RegisterSubscriber(id string, ch chan []byte) {
+	s.subMu.Lock()
+	s.subscribers[id] = ch
+	s.subMu.Unlock()
+}
+
+// RemoveSubscriber 移除注销的消费者
+func (s *RTKSource) RemoveSubscriber(id string) {
+	s.subMu.Lock()
+	delete(s.subscribers, id)
+	s.subMu.Unlock()
 }
 
 func (s *RTKSource) StartIngest() {
@@ -58,9 +78,7 @@ func (s *RTKSource) StartIngest() {
 }
 
 func (s *RTKSource) readLoop() {
-	// 确保退出时资源彻底释放
 	defer s.Close()
-
 	headerBuf := make([]byte, 3)
 
 	for {
@@ -70,61 +88,79 @@ func (s *RTKSource) readLoop() {
 		default:
 		}
 
-		// 1. 动态心跳超时控制
-		if err := s.conn.SetReadDeadline(time.Now().Add(ReadTimeout)); err != nil {
+		// 1. 安全熔断：速率限制检查
+		if !s.limiter.Allow() {
+			// 瞬时帧率过高，直接判定输入源异常，熔断连接以保护 CPU
 			return
 		}
 
-		// 2. 精准流式读取头部
+		_ = s.conn.SetReadDeadline(time.Now().Add(ReadTimeout))
+
 		if _, err := io.ReadFull(s.conn, headerBuf); err != nil {
 			return
 		}
 
-		// 3. 校验帧头
 		if headerBuf[0] != Rtcm3Header {
-			// 商用红线：不再使用 errors.New，不产生内存分配
 			return
 		}
 
-		// 4. 计算并校验长度边界
 		payloadLen := int(headerBuf[1]&0x03)<<8 | int(headerBuf[2])
-		if payloadLen < MinRtcmLen {
-			return
-		}
-		if payloadLen > MaxRtcmLen {
+		if payloadLen < MinRtcmLen || payloadLen > MaxRtcmLen {
 			return
 		}
 
-		// 总物理长度 = 3字节头 + 负载 + 3字节CRC
 		totalFrameLen := 3 + payloadLen + 3
 
-		// 5. 内存零逃逸获取：直接从对象池取出承载容器
+		// 从对象池借出内存
 		buf := FrameBufferPool.Get().([]byte)
 		copy(buf[0:3], headerBuf)
 
-		// 6. 流式补全后续字节
 		if _, err := io.ReadFull(s.conn, buf[3:totalFrameLen]); err != nil {
-			FrameBufferPool.Put(buf)
+			s.safePut(buf)
 			return
 		}
 
-		// 7. 构造切片指针发往下游
-		// 注意：这里没有 make 动作！直接将对象池内存切片送入通道
+		// 2. 深度重构：广播分发模型（隔离慢消费者）
+		s.subMu.RLock()
+		if len(s.subscribers) == 0 {
+			// 当前没有流动站在线，直接原地回收，拒绝无意义的内存滞留
+			s.safePut(buf)
+			s.subMu.RUnlock()
+			continue
+		}
+
+		// 准备分发的数据
 		sendFrame := buf[:totalFrameLen]
 
-		// 8. 抛弃策略（Backpressure）
-		select {
-		case s.DataChan <- sendFrame:
-			// 投递成功。特别注意：下游（Caster消费者）在将该数据写给所有 rover 客户端后，
-			// 必须执行：ntripio.FrameBufferPool.Put(frame[:cap(frame)]) 归还内存！
-		default:
-			// 下游积压，直接抛弃当前帧，保障实时性，并立即将内存归还对象池
-			FrameBufferPool.Put(buf)
+		for id, ch := range s.subscribers {
+			// 为每个订阅者（如 Caster 转发实例）单独分配一份拷贝，彻底实现消费者间的内存与拥堵隔离
+			// 注意：此处必须独立 make，因为每个消费者的发送时序不同，无法共用一个 Pool 缓冲
+			clientBuf := make([]byte, totalFrameLen)
+			copy(clientBuf, sendFrame)
+
+			select {
+			case ch <- clientBuf:
+				// 发送成功，由各个消费者自行负责其内存的 lifecycle
+			default:
+				// 某个消费者网络阻塞卡满了自己的管道：直接丢弃该消费者的这一帧
+				// 实现了“谁卡顿，谁丢帧”，绝对不影响注册表里的其他正常消费者！
+				_ = id
+			}
 		}
+		s.subMu.RUnlock()
+
+		// 广播数据产生完毕后，立即释放 Ingress 侧的原始承载容器
+		s.safePut(buf)
 	}
 }
 
-// Close 升级为安全的单向关闭机制
+// safePut 安全归还对象池，防止异常超大容量切片污染 Pool 导致常驻内存膨胀
+func (s *RTKSource) safePut(buf []byte) {
+	if buf != nil && cap(buf) <= 2048 {
+		FrameBufferPool.Put(buf)
+	}
+}
+
 func (s *RTKSource) Close() {
 	s.closeOnce.Do(func() {
 		s.cancel()
@@ -132,15 +168,11 @@ func (s *RTKSource) Close() {
 			_ = s.conn.Close()
 		}
 
-		// 修正：在长连接高并发场景下，不应随意 close 带有多个上下游关系的 channel。
-		// 通过 select 非阻塞清空并辅以 context 判定，能够更平滑地通知消费端下线。
-		close(s.DataChan)
-
-		// 清洗通道中留存的切片，防止内存残留在对象池外部引发内存泄漏
-		for frame := range s.DataChan {
-			if frame != nil {
-				FrameBufferPool.Put(frame[:cap(frame)])
-			}
+		s.subMu.Lock()
+		for id, ch := range s.subscribers {
+			close(ch)
+			delete(s.subscribers, id)
 		}
+		s.subMu.Unlock()
 	})
 }

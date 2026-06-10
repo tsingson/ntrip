@@ -5,6 +5,7 @@ version.txt
 *.so
 *.dylib
 **/bin/
+cmd/bin/
 **/linux-bin/
 # Test binary, build with `go test -c`
 *.test
