@@ -1,3 +1,5 @@
+// CORS get location for RTK base station
+
 package main
 
 import (
