@@ -31,7 +31,7 @@ func main() {
 			continue
 		}
 
-		// log.Printf("正在尝试连接串口 %s...", portName)
+		log.Printf("正在尝试连接串口 %s...", portName)
 		port, err := serial.OpenPort(config)
 		if err != nil {
 			// 修正：将 log.Errorf 改为标准的 log.Printf
@@ -40,13 +40,13 @@ func main() {
 			continue
 		}
 
-		// log.Println("串口连接成功，开始读取数据...")
-		// fmt.Println("\n--- 接收数据流 ---")
+		log.Println("串口连接成功，开始读取数据...")
+		fmt.Println("\n--- 接收数据流 ---")
 
 		// 执行核心读取逻辑
 		runReader(port)
 
-		// log.Println("\n--- 连接已断开，准备重连 ---")
+		log.Println("\n--- 连接已断开，准备重连 ---")
 		time.Sleep(2 * time.Second)
 	}
 }
@@ -69,7 +69,7 @@ func runReader(port io.ReadWriteCloser) {
 		if err != nil {
 			// 识别设备拔出或关闭的致命错误
 			if err == io.EOF || errors.Is(err, os.ErrClosed) {
-				// log.Println("\n[提示] 串口设备已断开连接。")
+				log.Println("\n[提示] 串口设备已断开连接。")
 				break
 			}
 			// 忽略非致命的 ReadTimeout 超时错误，继续轮询
@@ -91,7 +91,7 @@ func hasPermission(portName string) bool {
 	}
 
 	// 尝试以读写模式打开文件以测试权限
-	file, err := os.OpenFile(portName, os.O_RDWR, 0666)
+	file, err := os.OpenFile(portName, os.O_RDWR, 0o666)
 	if err != nil {
 		if os.IsPermission(err) {
 			log.Printf("[⚠️ 权限错误] 当前用户没有对 %s 的读写权限！", portName)
