@@ -5,6 +5,13 @@ version.txt
 *.so
 *.dylib
 **/bin/
+.idea/*
+*/.idea/*
+*/packages
+*/.pio
+*/.pio/*
+*/.idea
+.idea/
 cmd/bin/
 **/linux-bin/
 */bin/*
